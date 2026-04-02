@@ -18,7 +18,7 @@ Este repositorio contiene el núcleo algorítmico diseñado para extraer informa
 ## 📂 Estructura del Repositorio
 - `/python`: Suite completa de validación numérica (AKF, UKF, EKF, LKF).
   - `simulacion_completa_ibi.py`: Generador de métricas teóricas y tablas LaTeX.
-  - `TEST_DE_VALIDACION_*.py`: Pruebas de estrés y trayectoria geodésica.
+  - `test_de_validacion_*.py`: Pruebas de estrés y trayectoria geodésica.
 - `/docs`: Documentación técnica y preprints de la Unidad Proyecto Aragua.
 - `/firmware`: (En desarrollo) Implementación en C++/TinyML para microcontroladores.
 
