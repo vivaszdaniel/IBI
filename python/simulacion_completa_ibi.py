@@ -4,8 +4,8 @@ Versión: 2.0
 Autor: Daniel Vivas - dvivas1@uc.edu.ve
 Fecha: Marzo 2026
 
-Basado en: "Límites Termodinámicos de la Extracción de Información en Sistemas Iónicos"
-           (Thermodynamic Bounds of Information Extraction in Ionic Systems)
+Basado en: "Límites Termodinámicos de la Extracción de Información en Sistemas Iónicos de la Teoría Efectiva de Instrumentación Basada en Información (IBI)"
+           (Thermodynamic Bounds of Information Extraction in Ionic Systems from the Effective Theory of Information-Based Instrumentation (IBI))
 
 Simula:
 1. Φ_γ - Factor de no-idealidad (Eq. 16.2) 
