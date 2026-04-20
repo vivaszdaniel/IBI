@@ -1,29 +1,20 @@
 """
-TEST DE VALIDACIÓN IBI - AKF CON D_KL Y TRAYECTORIA GEODÉSICA
-Versión: 7.1
+TEST DE VALIDACIÓN IBI - AKF (ADAPTIVE KALMAN FILTER)
+Autor: Daniel Vivas 
+Email: dvivas1@uc.edu.ve
+Afiliacion: Universidad de Carabobo, Venezuela
 Fecha: Marzo 2026
-Autor: Daniel Vivas - dvivas1@uc.edu.ve
-            
-CORRECCIÓN PRINCIPAL:
-- compare_variance_reduction: Limitar ventana a zona estable para evitar 
-  que el drift infle artificialmente el ratio de reducción de varianza
-  
 Genera:
-- convergencia_mse_TIMESTAMP.png (Figura 1)
-- reduccion_varianza_TIMESTAMP.png (Figura 2)
-- senal_ibi_TIMESTAMP.png (Figura 3)
-- trayectoria_geodesica_TIMESTAMP.png (Figura 4 - NUEVA PARA IBI28)
-- dkL_por_iteracion_TIMESTAMP.csv (Datos para análisis)
+    convergencia_mse_TIMESTAMP.png - MSE vs. Tiempo (Figura 1 del paper)
+    reduccion_varianza_TIMESTAMP.png - Ratio vs. Muestras (Figura 2 del paper)
+    senal_ibi_TIMESTAMP.png - Resiliencia IBI (Figura 3 del paper)
 """
-
 import numpy as np
 import matplotlib.pyplot as plt
 import json
 import csv
 from datetime import datetime
 import os
-from scipy import stats
-from scipy.special import rel_entr
 
 # ================================================================================
 # CONFIGURACIÓN
@@ -41,8 +32,6 @@ TEST_CONFIG = {
     'preliminary_validation_threshold': 0.87,
     'export_csv': True,
     'export_json': True,
-    'calculate_dkl': True,  # NUEVO: Activar cálculo de D_KL
-    'geodesic_tracking': True,  # NUEVO: Seguimiento de trayectoria geodésica
 }
 
 PHYSICAL_CONSTANTS = {
@@ -50,129 +39,7 @@ PHYSICAL_CONSTANTS = {
     'R': 8.314,
     'T': 298.15,
     'kB': 1.381e-23,
-    'ln2': np.log(2),
 }
-
-# ================================================================================
-# FUNCIONES DE INFORMACIÓN GEOMÉTRICA (NUEVO PARA IBI28)
-# ================================================================================
-def calculate_fisher_information_matrix(theta, measurements, sigma_noise=1e-5):
-    """
-    Calcular la Matriz de Información de Fisher para el estado actual.
-    Para modelo gaussiano y ~ N(h(theta), R):
-    I_F(theta) = (dh/dtheta)^T R^{-1} (dh/dtheta)
-    """
-    n_states = len(theta)
-    I_F = np.zeros((n_states, n_states))
-    
-    # Aproximación numérica del Jacobiano dh/dtheta
-    epsilon = 1e-6
-    h_base = float(np.mean(measurements))  # ← CORRECCIÓN: Extraer escalar explícitamente
-    
-    for i in range(n_states):
-        for j in range(n_states):
-            # Perturbación hacia adelante
-            theta_plus_i = theta.copy()
-            theta_plus_i[i] += epsilon
-            h_plus_i = h_base * (1 + epsilon * (1 if i == 0 else 0.1))
-            
-            theta_plus_j = theta.copy()
-            theta_plus_j[j] += epsilon
-            h_plus_j = h_base * (1 + epsilon * (1 if j == 0 else 0.1))
-            
-            # Elemento de Fisher (CORRECCIÓN: todos son escalares ahora)
-            diff_i = h_plus_i - h_base  # Ya es escalar
-            diff_j = h_plus_j - h_base  # Ya es escalar
-            I_F[i, j] = (diff_i * diff_j) / (sigma_noise**2)
-    
-    # Regularización para estabilidad numérica
-    I_F += np.eye(n_states) * 1e-10
-    
-    return I_F
-
-
-def calculate_fisher_distance(theta_A, theta_B, I_F):
-    """
-    Calcular la Distancia de Fisher (aproximación geodésica local).
-    Δs_Fisher = sqrt((θ_B - θ_A)^T I_F (θ_B - θ_A))
-    """
-    d_theta = theta_B - theta_A
-    d_fisher = np.sqrt(np.dot(d_theta, np.dot(I_F, d_theta)))
-    return d_fisher
-
-
-def calculate_kl_divergence_gaussian(p_mean, p_var, q_mean, q_var):
-    """
-    Calcular Divergencia de Kullback-Leibler entre dos distribuciones gaussianas.
-    D_KL(P || Q) = 0.5 * [log(q_var/p_var) + (p_var + (p_mean - q_mean)^2)/q_var - 1]
-    """
-    # Evitar divisiones por cero y logs de números negativos
-    p_var = max(p_var, 1e-10)
-    q_var = max(q_var, 1e-10)
-    
-    d_kl = 0.5 * (
-        np.log(q_var / p_var) + 
-        (p_var + (p_mean - q_mean)**2) / q_var - 1
-    )
-    
-    return max(d_kl, 0)  # D_KL siempre >= 0
-
-
-def calculate_kl_divergence_empirical(p_samples, q_samples, n_bins=50):
-    """
-    Calcular D_KL empírica usando histogramas.
-    """
-    # Crear histogramas con el mismo soporte
-    range_min = min(p_samples.min(), q_samples.min())
-    range_max = max(p_samples.max(), q_samples.max())
-    
-    p_hist, bin_edges = np.histogram(p_samples, bins=n_bins, range=(range_min, range_max), density=True)
-    q_hist, _ = np.histogram(q_samples, bins=n_bins, range=(range_min, range_max), density=True)
-    
-    # Evitar ceros (suavizado)
-    epsilon = 1e-10
-    p_hist = p_hist + epsilon
-    q_hist = q_hist + epsilon
-    
-    # Normalizar
-    p_hist = p_hist / np.sum(p_hist)
-    q_hist = q_hist / np.sum(q_hist)
-    
-    # Calcular D_KL
-    d_kl = np.sum(rel_entr(p_hist, q_hist))
-    
-    return d_kl
-
-
-def calculate_geodesic_trajectory(theta_history, I_F_history):
-    """
-    Calcular la trayectoria geodésica acumulada en el manifold de Fisher.
-    """
-    n_iter = len(theta_history)
-    geodesic_distance = np.zeros(n_iter)
-    
-    for k in range(1, n_iter):
-        if k < len(I_F_history):
-            I_F = I_F_history[k]
-            d_fisher = calculate_fisher_distance(
-                theta_history[k-1], 
-                theta_history[k], 
-                I_F
-            )
-            geodesic_distance[k] = geodesic_distance[k-1] + d_fisher
-    
-    return geodesic_distance
-
-
-def calculate_landauer_energy_bound(d_kl_reduction, temperature=298.15):
-    """
-    Calcular el límite energético de Landauer para la reducción de D_KL.
-    E_min >= k_B * T * ΔD_KL
-    """
-    kB = PHYSICAL_CONSTANTS['kB']
-    e_min = kB * temperature * d_kl_reduction
-    return e_min
-
 
 # ================================================================================
 # FILTRO DE KALMAN ADAPTATIVO (AKF) CON H CORREGIDA
@@ -180,12 +47,12 @@ def calculate_landauer_energy_bound(d_kl_reduction, temperature=298.15):
 class AdaptivePhysicsInformedKalmanFilter:
     """
     Filtro de Kalman Adaptativo - Solo R se adapta según innovación (Q fija)
+    
     CORRECCIÓN: El manuscrito ahora especifica claramente que esta implementación
     adapta únicamente la covarianza de medición R basada en la innovación del sensor.
     La covarianza de proceso Q permanece fija para garantizar estabilidad numérica
     en recursos limitados (ESP32-S3).
     """
-    
     def __init__(self, dt=0.075, alpha=0.1, R_base=1e-5):
         self.dt = dt
         self.n_states = 3
@@ -205,27 +72,9 @@ class AdaptivePhysicsInformedKalmanFilter:
         
         # Ruido de proceso (Q se mantiene fijo - NO adaptativo en esta versión)
         self.Q = np.diag([1e-6, 1e-7, 1e-5])
-
-    def filter(self, measurements, track_dkl=True):
-        """
-        Aplicar filtro de Kalman Adaptativo completo con seguimiento de D_KL
-        
-        Parámetros:
-        -----------
-        measurements : array
-            Señal de medición ruidosa
-        track_dkl : bool
-            Si True, calcular D_KL por iteración
-        
-        Retorna:
-        --------
-        x_est : ndarray
-            Estados estimados
-        dkl_history : list (opcional)
-            Historial de D_KL por iteración
-        fisher_distance_history : list (opcional)
-            Distancia de Fisher por iteración
-        """
+    
+    def filter(self, measurements):
+        """Aplicar filtro de Kalman Adaptativo completo"""
         n_meas = len(measurements)
         x_est = np.zeros((n_meas, self.n_states))
         P = np.eye(self.n_states) * 0.1
@@ -238,15 +87,7 @@ class AdaptivePhysicsInformedKalmanFilter:
         # Reiniciar R adaptativo para cada nueva filtración
         self.R_anterior = self.R_base
         
-        # NUEVO PARA IBI28: Historiales para análisis de información
-        dkl_history = [] if track_dkl else None
-        fisher_distance_history = [] if track_dkl else None
-        I_F_history = [] if track_dkl else None
-        
-        # Estimación inicial de varianza del sensor
-        p_var_initial = np.var(measurements[:min(20, len(measurements))])
-        
-        for k in range(1, n_meas): 
+        for k in range(1, n_meas):
             # ========== PREDICCIÓN ==========
             x_pred = self.F @ x_est[k-1]
             P_pred = self.F @ P @ self.F.T + self.Q
@@ -256,8 +97,13 @@ class AdaptivePhysicsInformedKalmanFilter:
             residuo = z_k - (self.H @ x_pred)  # Innovación del sensor
             
             # ========== ADAPTACIÓN DE R (LÓGICA AKF) ==========
+            # Si el residuo es grande, aumenta R para "dudar" del sensor ruidoso
             R_adaptativo = (1 - self.alpha) * self.R_anterior + self.alpha * (residuo**2)
+            
+            # Limitar R_adaptativo para evitar inestabilidad numérica
             R_adaptativo = np.clip(R_adaptativo, self.R_base * 0.1, self.R_base * 1000)
+            
+            # Actualizar R_anterior para siguiente iteración
             self.R_anterior = R_adaptativo
             
             # ========== ACTUALIZACIÓN CON R ADAPTATIVO ==========
@@ -272,40 +118,14 @@ class AdaptivePhysicsInformedKalmanFilter:
             # Clip para estabilidad física
             x_upd[0] = np.clip(x_upd[0], 0, 0.01)
             x_est[k] = x_upd
-            
-            # ========== NUEVO PARA IBI28: CÁLCULO DE D_KL ==========
-            if track_dkl:
-                # Distribución del sensor (P): basada en medición ruidosa
-                p_mean = z_k
-                p_var = p_var_initial  # Varianza empírica del sensor
-                
-                # Distribución del filtro (Q): basada en estimación
-                q_mean = x_upd[0]
-                q_var = P[0, 0]  # Varianza del estado estimado
-                
-                # Calcular D_KL
-                d_kl = calculate_kl_divergence_gaussian(p_mean, p_var, q_mean, q_var)
-                dkl_history.append(d_kl)
-                
-                # Calcular matriz de Fisher y distancia geodésica
-                I_F = calculate_fisher_information_matrix(x_upd, measurements[:k+1], sigma_noise=np.sqrt(R_adaptativo))
-                I_F_history.append(I_F)
-                
-                if k > 1:
-                    d_fisher = calculate_fisher_distance(x_est[k-1], x_est[k], I_F)
-                    fisher_distance_history.append(d_fisher)
-                else:
-                    fisher_distance_history.append(0.0)
         
-        return x_est, dkl_history, fisher_distance_history, I_F_history
-
+        return x_est
 
 # ================================================================================
-# CLASE PRINCIPAL DE VALIDACIÓN (ACTUALIZADA PARA IBI28)
+# CLASE PRINCIPAL DE VALIDACIÓN (ACTUALIZADA PARA AKF)
 # ================================================================================
 class IBIStressTestStable:
-    """Test de validación con Filtro Kalman Adaptativo (AKF) + D_KL"""
-    
+    """Test de validación con Filtro Kalman Adaptativo (AKF)"""
     def __init__(self, config=TEST_CONFIG):
         self.config = config
         self.n_samples = config['n_samples']
@@ -316,15 +136,12 @@ class IBIStressTestStable:
         # AKF con parámetros de adaptación
         self.kalman_filter = AdaptivePhysicsInformedKalmanFilter(
             dt=self.dt, 
-            alpha=0.1,
+            alpha=0.1,  # Factor de suavizado AKF
             R_base=1e-5
         )
-        
         self.results = None
         self.observability_results = None
         self.variance_comparison = None
-        self.dkl_results = None  # NUEVO PARA IBI28
-        self.geodesic_results = None  # NUEVO PARA IBI28
 
     def generate_clean_signal(self):
         """Generar señal limpia"""
@@ -350,13 +167,10 @@ class IBIStressTestStable:
             averaged[i] = np.mean(raw_signal[:i+1])
         return averaged
 
-    def kalman_inference_engine(self, raw_signal, track_dkl=True):
-        """Motor Kalman Adaptativo con seguimiento de D_KL"""
-        x_est, dkl_hist, fisher_hist, I_F_hist = self.kalman_filter.filter(
-            raw_signal, 
-            track_dkl=track_dkl
-        )
-        return x_est[:, 0], dkl_hist, fisher_hist, I_F_hist
+    def kalman_inference_engine(self, raw_signal):
+        """Motor Kalman Adaptativo"""
+        x_est = self.kalman_filter.filter(raw_signal)
+        return x_est[:, 0]
 
     def calculate_metrics(self, y_true, y_pred):
         """Calcular métricas"""
@@ -430,14 +244,9 @@ class IBIStressTestStable:
         return self.observability_results
 
     def compare_variance_reduction(self, n_samples_range=[10, 50, 100, 200, 500]):
-        """
-        Comparar reducción de varianza - CORREGIDO PARA ALINEAR CON IBI_TEST_AKFR.py
-        
-        CORRECCIÓN CRÍTICA: Limitar ventana de comparación a zona estable
-        para evitar que el drift infle artificialmente el ratio.
-        """
+        """Comparar reducción de varianza"""
         print("\n" + "="*80)
-        print("COMPARACIÓN DE REDUCCIÓN DE VARIANZA (CORREGIDO)")
+        print("COMPARACIÓN DE REDUCCIÓN DE VARIANZA")
         print("="*80)
         
         results_by_samples = []
@@ -462,12 +271,10 @@ class IBIStressTestStable:
             for _ in range(50):
                 y_clean = self.generate_clean_signal()
                 y_noisy = self.generate_observed_signal(y_clean, snr_db=10)
-                 
-                y_avg = self.standard_averaging_estimator(y_noisy)
-                y_kalman, _, _, _ = self.kalman_inference_engine(y_noisy, track_dkl=False)
                 
-                # CORRECCIÓN: Usar ventana completa hasta time_interference
-                # (alineado con IBI_TEST_AKFR.py)
+                y_avg = self.standard_averaging_estimator(y_noisy)
+                y_kalman = self.kalman_inference_engine(y_noisy)
+                
                 err_avg = y_avg[:self.time_interference] - y_clean[:self.time_interference]
                 err_kalman = y_kalman[:self.time_interference] - y_clean[:self.time_interference]
                 
@@ -502,7 +309,7 @@ class IBIStressTestStable:
         return results_by_samples
 
     def run_validation_completa(self, n_iterations=None):
-        """Ejecutar validación completa con D_KL"""
+        """Ejecutar validación completa"""
         if n_iterations is None:
             n_iterations = self.config['n_iterations']
         
@@ -511,21 +318,12 @@ class IBIStressTestStable:
         metrics_pre = {'r2': [], 'rmse': [], 'mse': [], 'mae': [], 'mape': []}
         metrics_post = {'r2': [], 'rmse': [], 'mse': [], 'mae': [], 'mape': []}
         
-        # NUEVO PARA IBI28: Almacenamiento de D_KL
-        dkl_pre = []
-        dkl_post = []
-        geodesic_distance_pre = []
-        geodesic_distance_post = []
-        
         print(f"\nEjecutando {n_iterations} iteraciones de Monte Carlo...")
         
         for i in range(n_iterations):
             y_clean = self.generate_clean_signal()
             y_noisy = self.generate_observed_signal(y_clean, snr_db=self.config['snr_db'])
-            y_pred, dkl_hist, fisher_hist, I_F_hist = self.kalman_inference_engine(
-                y_noisy, 
-                track_dkl=self.config['calculate_dkl']
-            )
+            y_pred = self.kalman_inference_engine(y_noisy)
             
             delay = self.config['delay']
             
@@ -542,28 +340,17 @@ class IBIStressTestStable:
             if not np.isnan(m_pre['r2']) and np.isfinite(m_pre['r2']):
                 for key in metrics_pre:
                     metrics_pre[key].append(m_pre[key])
-                
-                # NUEVO: Almacenar D_KL
-                if self.config['calculate_dkl'] and dkl_hist:
-                    dkl_pre.append(np.mean(dkl_hist[delay:self.time_interference]))
-                    if fisher_hist:
-                        geodesic_distance_pre.append(np.sum(fisher_hist[delay:self.time_interference]))
             
             if not np.isnan(m_post['r2']) and np.isfinite(m_post['r2']):
                 for key in metrics_post:
                     metrics_post[key].append(m_post[key])
-                
-                # NUEVO: Almacenar D_KL
-                if self.config['calculate_dkl'] and dkl_hist:
-                    dkl_post.append(np.mean(dkl_hist[self.time_interference:]))
-                    if fisher_hist:
-                        geodesic_distance_post.append(np.sum(fisher_hist[self.time_interference:]))
         
         def summarize(metrics_dict):
             result = {}
             for key, values in metrics_dict.items():
                 if len(values) > 0:
                     # CORRECCIÓN CRÍTICA: IC95 = 1.96 * std / √n (intervalo de confianza de la media)
+                    # No: 1.96 * std (que es banda de dispersión, no IC de la media)
                     result[key] = {
                         'mean': float(np.mean(values)),
                         'std': float(np.std(values)),
@@ -584,161 +371,63 @@ class IBIStressTestStable:
             'config': self.config,
             'random_seed': RANDOM_SEED,
             'timestamp': datetime.now().isoformat(),
-            'akf_alpha': 0.1,
-            'akf_adaptation': 'R_only'
+            'akf_alpha': 0.1,  # Registrar parámetro AKF
+            'akf_adaptation': 'R_only'  # Especificar que solo R es adaptativo
         }
-        
-        # NUEVO PARA IBI28: Resultados de D_KL
-        if self.config['calculate_dkl']:
-            self.dkl_results = {
-                'pre': {
-                    'mean': float(np.mean(dkl_pre)) if dkl_pre else 0,
-                    'std': float(np.std(dkl_pre)) if dkl_pre else 0,
-                },
-                'post': {
-                    'mean': float(np.mean(dkl_post)) if dkl_post else 0,
-                    'std': float(np.std(dkl_post)) if dkl_post else 0,
-                },
-                'delta_dkl': float(np.mean(dkl_pre) - np.mean(dkl_post)) if (dkl_pre and dkl_post) else 0
-            }
-            
-            self.geodesic_results = {
-                'pre': {
-                    'mean': float(np.mean(geodesic_distance_pre)) if geodesic_distance_pre else 0,
-                },
-                'post': {
-                    'mean': float(np.mean(geodesic_distance_post)) if geodesic_distance_post else 0,
-                }
-            }
         
         return self.results
 
-    def plot_geodesic_trajectory(self, output_dir='./test_ibi_akf'):
-        """
-       Trayectoria Geodésica en el Manifold de Fisher
-        
-        Esta figura muestra:
-        1. D_KL por iteración (eje Y izquierdo)
-        2. Distancia geodésica acumulada (eje Y derecho)
-        3. MSE para correlación (eje Y secundario)
-        """
+    def export_results(self, output_dir='./test_ibi_akf'):
+        """Exportar resultados"""
         os.makedirs(output_dir, exist_ok=True)
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         
-        # Generar una corrida representativa con seguimiento de D_KL
-        y_clean = self.generate_clean_signal()
-        y_noisy = self.generate_observed_signal(y_clean, snr_db=self.config['snr_db'])
-        y_pred, dkl_hist, fisher_hist, I_F_hist = self.kalman_inference_engine(
-            y_noisy, 
-            track_dkl=True
-        )
+        json_path = os.path.join(output_dir, f'resultados_ibi_{timestamp}.json')
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump({
+                'results': self.results,
+                'observability': self.observability_results,
+                'variance_comparison': self.variance_comparison,
+                'physical_constants': PHYSICAL_CONSTANTS
+            }, f, indent=2, ensure_ascii=False)
+        print(f"✓ JSON exportado: {json_path}")
         
-        # Calcular MSE por iteración
-        mse_hist = (y_pred - y_clean)**2
-        
-        # Calcular distancia geodésica acumulada
-        geodesic_cumulative = np.cumsum(fisher_hist) if fisher_hist else np.zeros(len(dkl_hist))
-        
-        # Calcular límite energético de Landauer
-        dkl_reduction = np.maximum(0, np.diff(dkl_hist))
-        landauer_energy = [calculate_landauer_energy_bound(d) for d in dkl_reduction]
-        landauer_energy = np.insert(landauer_energy, 0, 0)
-        
-        # Crear figura con múltiples ejes
-        fig, ax1 = plt.subplots(figsize=(14, 8))
-        
-        # Eje Y izquierdo: D_KL
-        color_dkl = 'tab:red'
-        ax1.set_xlabel('Iteración del Filtro (k)', fontsize=12)
-        ax1.set_ylabel('Divergencia D_KL(P || Q) [nats]', color=color_dkl, fontsize=12)
-        ax1.plot(range(len(dkl_hist)), dkl_hist, color=color_dkl, linewidth=2, 
-                 label='D_KL(P_sensor || Q_filtro)', alpha=0.8)
-        ax1.tick_params(axis='y', labelcolor=color_dkl)
-        ax1.grid(True, alpha=0.3)
-        
-        # Eje Y derecho superior: Distancia geodésica acumulada
-        ax2 = ax1.twinx()
-        color_geo = 'tab:blue'
-        ax2.set_ylabel('Distancia Geodésica Acumulada Δs_Fisher', color=color_geo, fontsize=12)
-        ax2.plot(range(len(geodesic_cumulative)), geodesic_cumulative, color=color_geo, 
-                 linewidth=2, linestyle='--', label='Trayectoria Geodésica', alpha=0.6)
-        ax2.tick_params(axis='y', labelcolor=color_geo)
-        
-        # Eje Y derecho inferior: MSE (para correlación)
-        ax3 = ax1.twinx()
-        color_mse = 'tab:green'
-        ax3.spines['right'].set_position(('outward', 60))
-        ax3.set_ylabel('MSE Instantáneo', color=color_mse, fontsize=12)
-        ax3.plot(range(len(mse_hist)), mse_hist, color=color_mse, linewidth=1.5, 
-                 linestyle=':', label='MSE', alpha=0.5)
-        ax3.tick_params(axis='y', labelcolor=color_mse)
-        ax3.set_yscale('log')
-        
-        # Zona de interferencia
-        ax1.axvspan(self.time_interference, self.n_samples, color='red', alpha=0.1, 
-                   label='Zona de Interferencia')
-        
-        # Línea de tendencia para D_KL
-        z = np.polyfit(range(len(dkl_hist)), dkl_hist, 1)
-        p = np.poly1d(z)
-        ax1.plot(range(len(dkl_hist)), p(range(len(dkl_hist))), color='darkred', 
-                 linestyle='-.', linewidth=1, alpha=0.5, label='Tendencia D_KL')
-        
-        # Título y leyenda
-        plt.title('Trayectoria Geodésica del AKF en el Manifold de Fisher\n' +
-                  'Convergencia = Minimización de D_KL a lo largo de Geodésica', 
-                  fontsize=14, fontweight='bold')
-        
-        # Combinar leyendas
-        lines1, labels1 = ax1.get_legend_handles_labels()
-        lines2, labels2 = ax2.get_legend_handles_labels()
-        lines3, labels3 = ax3.get_legend_handles_labels()
-        ax1.legend(lines1 + lines2 + lines3, labels1 + labels2 + labels3, 
-                  loc='upper right', fontsize=10)
-        
-        plt.tight_layout()
-        
-        plot_path = os.path.join(output_dir, f'trayectoria_geodesica_{timestamp}.png')
-        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
-        plt.close()
-        
-        print(f"✓ Trayectoria geodésica: {plot_path}")
-        
-        # Exportar datos de D_KL para análisis
-        csv_path = os.path.join(output_dir, f'dkl_por_iteracion_{timestamp}.csv')
+        csv_path = os.path.join(output_dir, f'metricas_ibi_{timestamp}.csv')
         with open(csv_path, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
-            writer.writerow(['Iteración', 'D_KL_nats', 'Distancia_Geodésica', 'MSE', 
-                           'Landauer_Energy_Joules'])
-            for k in range(len(dkl_hist)):
-                writer.writerow([
-                    k, 
-                    dkl_hist[k] if k < len(dkl_hist) else 0,
-                    geodesic_cumulative[k] if k < len(geodesic_cumulative) else 0,
-                    mse_hist[k] if k < len(mse_hist) else 0,
-                    landauer_energy[k] if k < len(landauer_energy) else 0
-                ])
+            writer.writerow(['Fase', 'Métrica', 'Media', 'Std', 'IC95', 'Min', 'Max'])
+            
+            for fase in ['pre', 'post']:
+                for metrica in ['r2', 'rmse', 'mae', 'mape']:
+                    row = [
+                        fase, metrica,
+                        self.results[fase][metrica]['mean'],
+                        self.results[fase][metrica]['std'],
+                        self.results[fase][metrica]['ic95'],
+                        self.results[fase][metrica]['min'],
+                        self.results[fase][metrica]['max']
+                    ]
+                    writer.writerow(row)
+        print(f"✓ CSV exportado: {csv_path}")
         
-        print(f"✓ Datos D_KL exportados: {csv_path}")
-        
-        return plot_path, csv_path, {
-            'dkl_history': dkl_hist,
-            'geodesic_cumulative': geodesic_cumulative.tolist(),
-            'mse_history': mse_hist.tolist(),
-            'landauer_energy': landauer_energy.tolist(),
-            'correlation_dkl_mse': float(np.corrcoef(dkl_hist[:len(mse_hist)], mse_hist[:len(dkl_hist)])[0, 1]) if len(dkl_hist) == len(mse_hist) else None
-        }
+        return json_path, csv_path
 
     def plot_convergence_mse(self, output_dir='./test_ibi_akf'):
-        """Figura 1: MSE vs. Tiempo"""
+        """
+        FIGURA 1: MSE vs. Tiempo
+        CORRECCIÓN: Ahora compara Promediado Estándar vs. AKF (no sensor crudo vs. filtro)
+        Esto alinea con el título de la Sec 5.1 del manuscrito.
+        """
         os.makedirs(output_dir, exist_ok=True)
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         
+        # Generar datos de una corrida representativa para ver la "señal" del error
         y_clean = self.generate_clean_signal()
         y_noisy = self.generate_observed_signal(y_clean, snr_db=self.config['snr_db'])
-        y_kalman, _, _, _ = self.kalman_inference_engine(y_noisy, track_dkl=False)
+        y_kalman = self.kalman_inference_engine(y_noisy)
         y_avg = self.standard_averaging_estimator(y_noisy)
         
+        # CORRECCIÓN: Calcular error del promediado estándar (no ruido crudo)
         err_avg = (y_avg - y_clean)**2
         err_kalman = (y_kalman - y_clean)**2
         
@@ -746,7 +435,7 @@ class IBIStressTestStable:
         plt.plot(self.t * 1000, err_avg, color='orange', alpha=0.4, label='Error Promediado Estándar')
         plt.plot(self.t * 1000, err_kalman, color='red', linewidth=2, label='Error Filtro AKF (Propuesto)')
         
-        plt.yscale('log')
+        plt.yscale('log')  # Escala logarítmica para ver la convergencia real
         plt.xlabel('Tiempo de Adquisición (ms)', fontsize=12)
         plt.ylabel('MSE Instantáneo [log]', fontsize=12)
         plt.title('Convergencia de Error en Tiempo Real (Promediado vs. AKF)', fontsize=14, fontweight='bold')
@@ -759,8 +448,10 @@ class IBIStressTestStable:
         print(f"✓ Figura 1 corregida: {plot_path}")
         return plot_path
 
-    def plot_variance_reduction(self, output_dir='./test_validacion_ibi_akf'):
-        """Figura 2: Ratio de Mejora"""
+    def plot_variance_reduction(self, output_dir='./test_ibi_akf'):
+        """
+        FIGURA 2: Ratio de Mejora (Barras de desempeño)
+        """
         os.makedirs(output_dir, exist_ok=True)
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         
@@ -777,7 +468,7 @@ class IBIStressTestStable:
         plt.axhline(10, color='red', linestyle='--', label='Objetivo Paper (10x)')
         plt.xlabel('Número de Muestras (N)', fontsize=11)
         plt.ylabel('Factor de Mejora (Precisión)', fontsize=11)
-        plt.title('Ratio de Reducción de Varianza (AKF)', fontsize=13)
+        plt.title('Figura 2: Ratio de Reducción de Varianza (AKF)', fontsize=13)
         
         for bar in bars:
             height = bar.get_height()
@@ -793,27 +484,32 @@ class IBIStressTestStable:
         return plot_path
 
     def plot_signal_resilience(self, output_dir='./test_ibi_akf'):
-        """Figura 3: Comparación de Señales"""
+        """
+        FIGURA 3: Comparación de las dos gráficas (Normal vs Filtrada)
+        """
         os.makedirs(output_dir, exist_ok=True)
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         
         y_clean = self.generate_clean_signal()
         y_noisy = self.generate_observed_signal(y_clean, snr_db=self.config['snr_db'])
-        y_kalman, _, _, _ = self.kalman_inference_engine(y_noisy, track_dkl=False)
+        y_kalman = self.kalman_inference_engine(y_noisy)
         
         plt.figure(figsize=(14, 7))
         
+        # Sombreado de zonas
         plt.axvspan(0, self.t[self.time_interference], color='gray', alpha=0.1, label='Operación Normal')
         plt.axvspan(self.t[self.time_interference], self.t[-1], color='red', alpha=0.05, label='Zona de Interferencia')
         
+        # Señales
         plt.plot(self.t, y_noisy, color='orange', alpha=0.4, label='Señal Sensor (Ruidosa/Normal)', linewidth=1)
         plt.plot(self.t, y_clean, color='black', linestyle='--', alpha=0.6, label='Referencia Ideal')
         plt.plot(self.t, y_kalman, color='blue', label='Señal Filtrada (IBI-AKF)', linewidth=2.5)
         
-        plt.title("Resiliencia y Filtrado de Señal IBI (AKF)", fontsize=15, fontweight='bold')
+        plt.title("Figura 3: Resiliencia y Filtrado de Señal IBI (AKF)", fontsize=15, fontweight='bold')
         plt.xlabel("Tiempo (segundos)", fontsize=12)
         plt.ylabel("Amplitud / Información (Ψ)", fontsize=12)
         
+        # Ajuste dinámico de escala para que se vea la comparación
         margin = (np.max(y_noisy) - np.min(y_noisy)) * 0.1
         plt.ylim(np.min(y_noisy) - margin, np.max(y_noisy) + margin)
         
@@ -827,7 +523,7 @@ class IBIStressTestStable:
         return plot_path
 
     def print_summary(self):
-        """Imprimir resumen con D_KL"""
+        """Imprimir resumen"""
         if self.results is None:
             print("⚠ Ejecutar run_validation_completa() primero")
             return
@@ -844,16 +540,6 @@ class IBIStressTestStable:
         print(f"  R²:   {self.results['post']['r2']['mean']:.5f} ± {self.results['post']['r2']['ic95']:.5f} (IC95)")
         print(f"  RMSE: {self.results['post']['rmse']['mean']:.6e}")
         
-        # NUEVO PARA IBI28: Resultados de D_KL
-        if self.dkl_results:
-            print(f"\n{'='*80}")
-            print("RESULTADOS DE INFORMACIÓN (NUEVO PARA IBI28):")
-            print(f"  D_KL promedio (pre):  {self.dkl_results['pre']['mean']:.6f} nats")
-            print(f"  D_KL promedio (post): {self.dkl_results['post']['mean']:.6f} nats")
-            print(f"  ΔD_KL:                {self.dkl_results['delta_dkl']:.6f} nats")
-            print(f"  Distancia geodésica (pre):  {self.geodesic_results['pre']['mean']:.6f}")
-            print(f"  Distancia geodésica (post): {self.geodesic_results['post']['mean']:.6f}")
-        
         delta_r2 = abs(self.results['pre']['r2']['mean'] - self.results['post']['r2']['mean'])
         
         print(f"\n{'='*80}")
@@ -865,38 +551,63 @@ class IBIStressTestStable:
         print(f"  Adaptación: {self.results.get('akf_adaptation', 'R_only')} (solo R, Q fija)")
         print("="*80)
 
-
 # ================================================================================
 # EJECUCIÓN PRINCIPAL
 # ================================================================================
 if __name__ == "__main__":
     print("="*80)
-    print("STRESS-TEST IBI - AKF CON D_KL Y TRAYECTORIA GEODÉSICA")
-    print("Versión 7.1 - Corregido (Alineado con IBI_TEST_AKFR.py)")
+    print("STRESS-TEST IBI - AKF (3 GRÁFICAS PARA PAPER)")
+    print("Versión 6.1 - Correcciones Post-Revisión")
     print("="*80)
     
     tester = IBIStressTestStable(config=TEST_CONFIG)
-
+    
     # 1. Verificar observabilidad
     observability = tester.verify_observability_matrix()
 
-    # 2. Comparar reducción de varianza (CORREGIDO)
+    # 2. Comparar reducción de varianza
     variance_results = tester.compare_variance_reduction()
 
-    # 3. Ejecutar validación completa con D_KL
+    # 3. Ejecutar validación completa
     results = tester.run_validation_completa()
 
     # 4. Imprimir resumen
     tester.print_summary()
 
-    # 5. Generar LAS CUATRO GRÁFICAS (incluyendo nueva Figura 4)
+    # 5. Verificar criterios
     print("\n" + "="*80)
-    print("GENERANDO 4 GRÁFICAS PARA IBI")
+    print("VERIFICACIÓN DE CRITERIOS")
+    print("="*80)
+
+    delta_r2 = abs(results['pre']['r2']['mean'] - results['post']['r2']['mean'])
+
+    criterios = {
+        'ΔR² < 0.30': delta_r2 < 0.30,
+        'R² > 0.87 (pre)': results['pre']['r2']['mean'] > 0.87,
+        'N ≥ 95 corridas': results['n_valid_pre'] >= 95,
+        'Sistema observable': observability['observable'],
+    }
+
+    all_passed = True
+    for criterio, passed in criterios.items():
+        print(f"  {'✓' if passed else '✗'} {criterio}")
+        all_passed = all_passed and passed
+
+    print(f"\n  VEREDICTO: {'✓ CUMPLE' if all_passed else '⚠ PENDIENTE'}")
+    print("="*80)
+
+    # 6. Exportar resultados
+    if TEST_CONFIG['export_csv'] or TEST_CONFIG['export_json']:
+        tester.export_results()
+
+    # 7. Generar LAS TRES GRÁFICAS
+    print("\n" + "="*80)
+    print("GENERANDO 3 GRÁFICAS PARA PAPER")
     print("="*80)
 
     plot_dir = './test_ibi_akf'
 
-    # Figura 1: Convergencia MSE
+    # Figura 1: Convergencia MSE (LA MÁS IMPORTANTE - CORREGIDA)
     tester.plot_convergence_mse(plot_dir)
 
     # Figura 2: Reducción de Varianza
@@ -905,16 +616,6 @@ if __name__ == "__main__":
     # Figura 3: Señal IBI
     tester.plot_signal_resilience(plot_dir)
 
-    # Figura 4 (NUEVA): Trayectoria Geodésica con D_KL
-    geodesic_plot, dkl_csv, geodesic_data = tester.plot_geodesic_trajectory(plot_dir)
-
-    # Imprimir correlación D_KL - MSE
-    if geodesic_data['correlation_dkl_mse']:
-        print(f"\n{'='*80}")
-        print(f"CORRELACIÓN D_KL - MSE: {geodesic_data['correlation_dkl_mse']:.4f}")
-        print(f"{'='*80}")
-
     print(f"\n✓ Validación finalizada")
     print(f"✓ Todas las gráficas generadas en: {plot_dir}")
-    print(f"✓ trayectoria geodésica")
     print("="*80)
