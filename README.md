@@ -29,3 +29,7 @@ Para ejecutar las validaciones:
 ```bash
 pip install -r requirements.txt
 python python/simulacion_completa_ibi.py
+python python/test_de_validacion_akf.py
+python python/test_de_validacion_ekf.py
+python python/test_de_validacion_lkf.py
+python python/test_de_validacion_ukf.py
